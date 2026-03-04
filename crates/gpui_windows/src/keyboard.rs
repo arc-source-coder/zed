@@ -147,16 +147,13 @@ impl WindowsKeyboardMapper {
 
 pub(crate) fn get_keystroke_key(
     vkey: VIRTUAL_KEY,
-    scan_code: u32,
-    modifiers: &mut Modifiers,
+    _scan_code: u32,
+    _modifiers: &mut Modifiers,
 ) -> Option<String> {
-    if modifiers.shift && need_to_convert_to_shifted_key(vkey) {
-        get_shifted_key(vkey, scan_code).inspect(|_| {
-            modifiers.shift = false;
-        })
-    } else {
-        get_key_from_vkey(vkey)
-    }
+    // Always return the unshifted key. The shift modifier in `modifiers`
+    // already indicates that shift is pressed. This matches the expected
+    // behavior where key="1", shift=true, key_char="!" for Shift+1.
+    get_key_from_vkey(vkey)
 }
 
 fn get_key_from_vkey(vkey: VIRTUAL_KEY) -> Option<String> {
