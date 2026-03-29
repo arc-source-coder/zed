@@ -9,7 +9,7 @@ use collections::{FxHashMap, FxHashSet};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT},
         Graphics::{
             Direct3D::*,
             Direct3D11::*,
@@ -17,6 +17,7 @@ use windows::{
             DirectWrite::*,
             Dxgi::{Common::*, *},
         },
+        System::Threading::WaitForSingleObjectEx,
     },
     core::{IUnknown, Interface},
 };
@@ -27,6 +28,7 @@ use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+const SWAP_CHAIN_FLAGS: i32 = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 
@@ -81,6 +83,7 @@ struct DirectXResources {
     // Direct3D rendering objects
     swap_chain: IDXGISwapChain1,
     composition_surface_handle: Option<HANDLE>,
+    frame_latency_waitable_object: Option<HANDLE>,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
@@ -249,6 +252,22 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    fn wait_for_frame_latency(&self) {
+        let Some(waitable_object) = self
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.frame_latency_waitable_object)
+        else {
+            return;
+        };
+
+        let wait_result = unsafe { WaitForSingleObjectEx(waitable_object, 100, true) };
+        if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_TIMEOUT {
+            return;
+        }
+        log::warn!("frame latency wait returned unexpected status: {wait_result:?}");
+    }
+
     #[inline]
     fn present(&mut self) -> Result<()> {
         let result = unsafe {
@@ -256,7 +275,7 @@ impl DirectXRenderer {
                 .as_ref()
                 .expect("resources missing")
                 .swap_chain
-                .Present(0, DXGI_PRESENT(0))
+                .Present(1, DXGI_PRESENT(0))
         };
         result.ok().context("Presenting swap chain failed")
     }
@@ -468,6 +487,7 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        self.wait_for_frame_latency();
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
@@ -548,10 +568,12 @@ impl DirectXRenderer {
                     width,
                     height,
                     RENDER_TARGET_FORMAT,
-                    DXGI_SWAP_CHAIN_FLAG(0),
+                    DXGI_SWAP_CHAIN_FLAG(SWAP_CHAIN_FLAGS),
                 )
                 .context("Failed to resize swap chain")?;
         }
+        resources.frame_latency_waitable_object =
+            configure_frame_latency_waitable_object(&resources.swap_chain);
 
         resources.recreate_resources(devices, width, height)?;
 
@@ -1034,9 +1056,12 @@ impl DirectXResources {
         ) = create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
+        let frame_latency_waitable_object = configure_frame_latency_waitable_object(&swap_chain);
+
         Ok(Self {
             swap_chain,
             composition_surface_handle,
+            frame_latency_waitable_object,
             render_target: Some(render_target),
             render_target_view,
             path_intermediate_texture,
@@ -1600,7 +1625,7 @@ fn create_swap_chain_for_composition_surface_handle(
         Scaling: DXGI_SCALING_NONE,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-        Flags: 0,
+        Flags: SWAP_CHAIN_FLAGS as u32,
     };
     let swap_chain = unsafe {
         factory_media.CreateSwapChainForCompositionSurfaceHandle(
@@ -1637,7 +1662,7 @@ fn create_swap_chain(
         Scaling: DXGI_SCALING_NONE,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-        Flags: 0,
+        Flags: SWAP_CHAIN_FLAGS as u32,
     };
     let swap_chain =
         unsafe { dxgi_factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None) }?;
@@ -1676,6 +1701,24 @@ fn create_resources(
         path_intermediate_msaa_view,
         viewport,
     ))
+}
+
+fn configure_frame_latency_waitable_object(swap_chain: &IDXGISwapChain1) -> Option<HANDLE> {
+    let Ok(swap_chain2) = swap_chain.cast::<IDXGISwapChain2>() else {
+        return None;
+    };
+
+    if let Err(err) = unsafe { swap_chain2.SetMaximumFrameLatency(1) } {
+        log::warn!("SetMaximumFrameLatency(1) failed: {err:#}");
+        return None;
+    }
+
+    let waitable_object = unsafe { swap_chain2.GetFrameLatencyWaitableObject() };
+    if waitable_object.is_invalid() {
+        return None;
+    }
+
+    Some(waitable_object)
 }
 
 #[inline]
