@@ -1,10 +1,12 @@
 use std::{
     slice,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use ::util::ResultExt;
 use anyhow::{Context, Result};
+use collections::{FxHashMap, FxHashSet};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use windows::{
     Win32::{
         Foundation::HWND,
@@ -16,7 +18,7 @@ use windows::{
             Dxgi::{Common::*, *},
         },
     },
-    core::Interface,
+    core::{IUnknown, Interface},
 };
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
@@ -42,6 +44,10 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    external_surface_commands_rx: Receiver<ExternalSurfaceCommand>,
+    external_surface_commands_tx: Sender<ExternalSurfaceCommand>,
+    external_surface_visuals: FxHashMap<ExternalSurfaceId, ExternalSurfaceVisualState>,
+    next_external_surface_id: u64,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -74,6 +80,7 @@ pub(crate) struct DirectXRendererDevices {
 struct DirectXResources {
     // Direct3D rendering objects
     swap_chain: IDXGISwapChain1,
+    composition_surface_handle: Option<HANDLE>,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
@@ -106,7 +113,17 @@ struct DirectXGlobalElements {
 struct DirectComposition {
     comp_device: IDCompositionDevice,
     comp_target: IDCompositionTarget,
-    comp_visual: IDCompositionVisual,
+    container_visual: IDCompositionVisual,
+    gpui_visual: IDCompositionVisual,
+}
+
+#[derive(Default)]
+struct ExternalSurfaceVisualState {
+    surface_handle: Option<HANDLE>,
+    surface: Option<IUnknown>,
+    visual: Option<IDCompositionVisual>,
+    clip: Option<IDCompositionRectangleClip>,
+    last_bounds: Option<Bounds<ScaledPixels>>,
 }
 
 impl DirectXRendererDevices {
@@ -149,6 +166,7 @@ impl DirectXRenderer {
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
             .context("Creating DirectX devices")?;
         let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
+        let (external_surface_commands_tx, external_surface_commands_rx) = unbounded();
 
         let resources = DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition)
             .context("Creating DirectX resources")?;
@@ -164,9 +182,12 @@ impl DirectXRenderer {
         } else {
             let composition = DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), hwnd)
                 .context("Creating DirectComposition")?;
+            let surface_handle = resources
+                .composition_surface_handle
+                .context("DirectComposition resources missing composition surface handle")?;
             composition
-                .set_swap_chain(&resources.swap_chain)
-                .context("Setting swap chain for DirectComposition")?;
+                .set_surface_handle(surface_handle)
+                .context("Setting composition surface for DirectComposition")?;
             Some(composition)
         };
 
@@ -177,6 +198,10 @@ impl DirectXRenderer {
             resources: Some(resources),
             globals,
             pipelines,
+            external_surface_commands_rx,
+            external_surface_commands_tx,
+            external_surface_visuals: FxHashMap::default(),
+            next_external_surface_id: 1,
             direct_composition,
             font_info: Self::get_font_info(),
             width: 1,
@@ -289,7 +314,10 @@ impl DirectXRenderer {
         } else {
             let composition =
                 DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
-            composition.set_swap_chain(&resources.swap_chain)?;
+            let surface_handle = resources
+                .composition_surface_handle
+                .context("DirectComposition resources missing composition surface handle")?;
+            composition.set_surface_handle(surface_handle)?;
             Some(composition)
         };
 
@@ -309,7 +337,129 @@ impl DirectXRenderer {
         self.pipelines = pipelines;
         self.path_data_buffer = path_data_buffer;
         self.direct_composition = direct_composition;
+        self.reset_external_surface_visuals_after_device_lost()?;
         self.skip_draws = true;
+        Ok(())
+    }
+
+    pub(crate) fn create_external_surface_host(
+        &mut self,
+        event_sender: Sender<ExternalSurfaceEvent>,
+    ) -> Option<ExternalSurfaceHost> {
+        if self.direct_composition.is_none() {
+            return None;
+        }
+
+        let id = ExternalSurfaceId(self.next_external_surface_id);
+        self.next_external_surface_id = self
+            .next_external_surface_id
+            .checked_add(1)
+            .expect("external surface id overflowed");
+
+        self.external_surface_visuals.insert(id, Default::default());
+
+        Some(ExternalSurfaceHost::new(
+            id,
+            Arc::new(Mutex::new(ExternalSurfaceState::default())),
+            event_sender,
+            self.external_surface_commands_tx.clone(),
+        ))
+    }
+
+    fn reset_external_surface_visuals_after_device_lost(&mut self) -> Result<()> {
+        for state in self.external_surface_visuals.values_mut() {
+            state.surface = None;
+            state.visual = None;
+            state.clip = None;
+        }
+
+        let Some(composition) = self.direct_composition.as_ref() else {
+            return Ok(());
+        };
+
+        let mut needs_commit = false;
+        for state in self.external_surface_visuals.values_mut() {
+            let Some(bounds) = state.last_bounds else {
+                continue;
+            };
+            needs_commit |= apply_external_surface_visual(composition, state, bounds)?;
+        }
+
+        if needs_commit {
+            unsafe { composition.comp_device.Commit()? };
+        }
+
+        Ok(())
+    }
+
+    fn process_external_surface_commands(&mut self) -> Result<bool> {
+        let Some(composition) = self.direct_composition.as_ref() else {
+            while self.external_surface_commands_rx.try_recv().is_ok() {}
+            return Ok(false);
+        };
+
+        let mut needs_commit = false;
+        while let Ok(command) = self.external_surface_commands_rx.try_recv() {
+            match command {
+                ExternalSurfaceCommand::SetSurfaceHandle { id, handle } => {
+                    let state = self.external_surface_visuals.entry(id).or_default();
+                    if state.surface_handle != Some(handle) {
+                        state.surface_handle = Some(handle);
+                        state.surface = None;
+                    }
+                }
+                ExternalSurfaceCommand::HostDropped(id) => {
+                    if let Some(mut state) = self.external_surface_visuals.remove(&id) {
+                        needs_commit |= remove_external_surface_visual(composition, &mut state)?;
+                    }
+                }
+            }
+        }
+
+        Ok(needs_commit)
+    }
+
+    fn reconcile_external_surfaces(&mut self, scene: &Scene) -> Result<()> {
+        let mut needs_commit = self.process_external_surface_commands()?;
+        let Some(composition) = self.direct_composition.as_ref() else {
+            return Ok(());
+        };
+
+        let mut active_ids = FxHashSet::default();
+
+        for surface in &scene.external_surfaces {
+            if !active_ids.insert(surface.id) {
+                log::error!("duplicate external surface host in scene: {:?}", surface.id);
+                continue;
+            }
+
+            let effective_bounds = surface.bounds.intersect(&surface.content_mask.bounds);
+            let state = self.external_surface_visuals.entry(surface.id).or_default();
+            if effective_bounds.is_empty() {
+                needs_commit |= remove_external_surface_visual(composition, state)?;
+                continue;
+            }
+
+            needs_commit |= apply_external_surface_visual(composition, state, effective_bounds)?;
+        }
+
+        let stale_ids = self
+            .external_surface_visuals
+            .keys()
+            .copied()
+            .filter(|id| !active_ids.contains(id))
+            .collect::<Vec<_>>();
+        for id in stale_ids {
+            let Some(state) = self.external_surface_visuals.get_mut(&id) else {
+                continue;
+            };
+            needs_commit |= remove_external_surface_visual(composition, state)?;
+        }
+
+        if needs_commit {
+            unsafe { composition.comp_device.Commit()? };
+        }
+
         Ok(())
     }
 
@@ -329,6 +479,7 @@ impl DirectXRenderer {
         })?;
 
         self.upload_scene_buffers(scene)?;
+        self.reconcile_external_surfaces(scene)?;
 
         for batch in scene.batches() {
             match batch {
@@ -349,11 +500,14 @@ impl DirectXRenderer {
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::Surfaces(range) => {
+                    let _ = range;
+                    Ok(())
+                }
             }
             .context(format!(
                 "scene too large:\
-                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
+                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly",
                 scene.paths.len(),
                 scene.shadows.len(),
                 scene.quads.len(),
@@ -361,7 +515,6 @@ impl DirectXRenderer {
                 scene.monochrome_sprites.len(),
                 scene.subpixel_sprites.len(),
                 scene.polychrome_sprites.len(),
-                scene.surfaces.len(),
             ))?;
         }
         self.present()
@@ -798,13 +951,6 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
-        if surfaces.is_empty() {
-            return Ok(());
-        }
-        Ok(())
-    }
-
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let desc = unsafe { devices.adapter.GetDesc1() }?;
@@ -862,15 +1008,19 @@ impl DirectXResources {
         hwnd: HWND,
         disable_direct_composition: bool,
     ) -> Result<Self> {
-        let swap_chain = if disable_direct_composition {
-            create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)?
+        let (swap_chain, composition_surface_handle) = if disable_direct_composition {
+            (
+                create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)?,
+                None,
+            )
         } else {
-            create_swap_chain_for_composition(
+            let (swap_chain, surface_handle) = create_swap_chain_for_composition_surface_handle(
                 &devices.dxgi_factory,
                 &devices.device,
                 width,
                 height,
-            )?
+            )?;
+            (swap_chain, Some(surface_handle))
         };
 
         let (
@@ -886,6 +1036,7 @@ impl DirectXResources {
 
         Ok(Self {
             swap_chain,
+            composition_surface_handle,
             render_target: Some(render_target),
             render_target_view,
             path_intermediate_texture,
@@ -999,23 +1150,116 @@ impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
         let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
-        let comp_visual = unsafe { comp_device.CreateVisual() }?;
+        let container_visual = unsafe { comp_device.CreateVisual() }?;
+        let gpui_visual = unsafe { comp_device.CreateVisual() }?;
+
+        unsafe {
+            container_visual.AddVisual(&gpui_visual, true, None::<&IDCompositionVisual>)?;
+            comp_target.SetRoot(&container_visual)?;
+            comp_device.Commit()?;
+        }
 
         Ok(Self {
             comp_device,
             comp_target,
-            comp_visual,
+            container_visual,
+            gpui_visual,
         })
     }
 
-    pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
+    pub fn set_surface_handle(&self, surface_handle: HANDLE) -> Result<()> {
+        let surface = unsafe { self.comp_device.CreateSurfaceFromHandle(surface_handle) }?;
         unsafe {
-            self.comp_visual.SetContent(swap_chain)?;
-            self.comp_target.SetRoot(&self.comp_visual)?;
+            self.gpui_visual.SetContent(&surface)?;
             self.comp_device.Commit()?;
         }
         Ok(())
     }
+
+    fn create_external_visual(&self) -> Result<IDCompositionVisual> {
+        let visual = unsafe { self.comp_device.CreateVisual() }?;
+        unsafe {
+            self.container_visual
+                // Keep external surfaces below GPUI's own visual so GPUI chrome
+                // can render above them.
+                .AddVisual(&visual, false, Some(&self.gpui_visual))?;
+        }
+        Ok(visual)
+    }
+}
+
+fn apply_external_surface_visual(
+    composition: &DirectComposition,
+    state: &mut ExternalSurfaceVisualState,
+    bounds: Bounds<ScaledPixels>,
+) -> Result<bool> {
+    let created_visual = if state.visual.is_some() {
+        false
+    } else {
+        state.visual = Some(composition.create_external_visual()?);
+        true
+    };
+
+    let created_surface = if let Some(surface_handle) = state.surface_handle {
+        if state.surface.is_some() {
+            false
+        } else {
+            state.surface = Some(unsafe { composition.comp_device.CreateSurfaceFromHandle(surface_handle) }?);
+            true
+        }
+    } else {
+        false
+    };
+
+    if created_visual || created_surface {
+        let (Some(visual), Some(surface)) = (state.visual.as_ref(), state.surface.as_ref()) else {
+            return Ok(created_visual);
+        };
+        unsafe {
+            visual.SetContent(surface)?;
+        }
+    }
+
+    let clip = if let Some(clip) = state.clip.clone() {
+        clip
+    } else {
+        let clip = unsafe { composition.comp_device.CreateRectangleClip() }?;
+        state.clip = Some(clip.clone());
+        clip
+    };
+
+    if created_visual || state.last_bounds != Some(bounds) {
+        let visual = state.visual.as_ref().expect("external surface visual missing");
+        unsafe {
+            visual.SetOffsetX2(bounds.origin.x.0)?;
+            visual.SetOffsetY2(bounds.origin.y.0)?;
+            clip.SetLeft2(0.0)?;
+            clip.SetTop2(0.0)?;
+            clip.SetRight2(bounds.size.width.0)?;
+            clip.SetBottom2(bounds.size.height.0)?;
+            visual.SetClip(&clip)?;
+        }
+        state.last_bounds = Some(bounds);
+        return Ok(true);
+    }
+
+    Ok(created_visual || created_surface)
+}
+
+fn remove_external_surface_visual(
+    composition: &DirectComposition,
+    state: &mut ExternalSurfaceVisualState,
+) -> Result<bool> {
+    state.last_bounds = None;
+    let Some(visual) = state.visual.take() else {
+        return Ok(false);
+    };
+
+    unsafe {
+        composition.container_visual.RemoveVisual(&visual)?;
+    }
+    state.clip = None;
+    Ok(true)
 }
 
 /// Manages a GPU buffer for path data (color + bounds per path).
@@ -1328,12 +1572,20 @@ fn get_comp_device(dxgi_device: &IDXGIDevice) -> Result<IDCompositionDevice> {
     Ok(unsafe { DCompositionCreateDevice(dxgi_device)? })
 }
 
-fn create_swap_chain_for_composition(
+fn create_swap_chain_for_composition_surface_handle(
     dxgi_factory: &IDXGIFactory6,
     device: &ID3D11Device,
     width: u32,
     height: u32,
-) -> Result<IDXGISwapChain1> {
+) -> Result<(IDXGISwapChain1, HANDLE)> {
+    const COMPOSITIONSURFACE_ALL_ACCESS: u32 = 0x0003;
+    let surface_handle =
+        unsafe { DCompositionCreateSurfaceHandle(COMPOSITIONSURFACE_ALL_ACCESS, None) }
+            .context("DCompositionCreateSurfaceHandle failed")?;
+    let factory_media: IDXGIFactoryMedia = dxgi_factory
+        .cast()
+        .context("Creating IDXGIFactoryMedia")?;
+
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: width,
         Height: height,
@@ -1345,13 +1597,21 @@ fn create_swap_chain_for_composition(
         },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: BUFFER_COUNT as u32,
-        // Composition SwapChains only support the DXGI_SCALING_STRETCH Scaling.
-        Scaling: DXGI_SCALING_STRETCH,
+        Scaling: DXGI_SCALING_NONE,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
         Flags: 0,
     };
-    Ok(unsafe { dxgi_factory.CreateSwapChainForComposition(device, &desc, None)? })
+    let swap_chain = unsafe {
+        factory_media.CreateSwapChainForCompositionSurfaceHandle(
+            device,
+            Some(surface_handle),
+            &desc,
+            None,
+        )
+    }
+    .context("CreateSwapChainForCompositionSurfaceHandle failed")?;
+    Ok((swap_chain, surface_handle))
 }
 
 fn create_swap_chain(

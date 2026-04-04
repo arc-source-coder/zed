@@ -28,6 +28,11 @@ pub(crate) type PlatformScreenCaptureFrame = ();
 #[cfg(all(target_os = "macos", feature = "screen-capture"))]
 pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBuffer;
 
+#[cfg(target_os = "windows")]
+use crossbeam_channel::Sender;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::HANDLE;
+
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
@@ -62,7 +67,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use strum::EnumIter;
 use uuid::Uuid;
@@ -592,6 +597,125 @@ pub struct RequestFrameOptions {
     pub force_render: bool,
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExternalSurfaceId(pub u64);
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExternalSurfaceState {
+    pub logical_size: Size<Pixels>,
+    pub device_size: Size<DevicePixels>,
+    pub window_scale_factor: f32,
+    pub visible: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl Default for ExternalSurfaceState {
+    fn default() -> Self {
+        Self {
+            logical_size: size(px(0.), px(0.)),
+            device_size: size(DevicePixels(0), DevicePixels(0)),
+            window_scale_factor: 1.0,
+            visible: false,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalSurfaceEvent {
+    StateChanged,
+    Dropped,
+}
+
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub enum ExternalSurfaceCommand {
+    SetSurfaceHandle {
+        id: ExternalSurfaceId,
+        handle: HANDLE,
+    },
+    HostDropped(ExternalSurfaceId),
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for ExternalSurfaceCommand {}
+
+/// Opaque Windows-only handle to an externally presented composition surface.
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+pub struct ExternalSurfaceHost {
+    inner: Arc<ExternalSurfaceHostInner>,
+}
+
+#[cfg(target_os = "windows")]
+struct ExternalSurfaceHostInner {
+    id: ExternalSurfaceId,
+    state: Arc<Mutex<ExternalSurfaceState>>,
+    event_sender: Sender<ExternalSurfaceEvent>,
+    command_sender: Sender<ExternalSurfaceCommand>,
+}
+
+#[cfg(target_os = "windows")]
+impl ExternalSurfaceHost {
+    #[doc(hidden)]
+    pub fn new(
+        id: ExternalSurfaceId,
+        state: Arc<Mutex<ExternalSurfaceState>>,
+        event_sender: Sender<ExternalSurfaceEvent>,
+        command_sender: Sender<ExternalSurfaceCommand>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ExternalSurfaceHostInner {
+                id,
+                state,
+                event_sender,
+                command_sender,
+            }),
+        }
+    }
+
+    pub fn id(&self) -> ExternalSurfaceId {
+        self.inner.id
+    }
+
+    pub fn state(&self) -> Arc<Mutex<ExternalSurfaceState>> {
+        Arc::clone(&self.inner.state)
+    }
+
+    pub fn set_surface_handle(&self, handle: HANDLE) -> Result<()> {
+        self.inner
+            .command_sender
+            .send(ExternalSurfaceCommand::SetSurfaceHandle {
+                id: self.inner.id,
+                handle,
+            })
+            .map_err(|_| anyhow::anyhow!("external surface host receiver dropped"))?;
+        Ok(())
+    }
+
+    pub fn update_state(&self, next_state: ExternalSurfaceState) {
+        let mut state = self.inner.state.lock().expect("external surface state poisoned");
+        if *state == next_state {
+            return;
+        }
+        *state = next_state;
+        drop(state);
+        let _ = self.inner.event_sender.send(ExternalSurfaceEvent::StateChanged);
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ExternalSurfaceHostInner {
+    fn drop(&mut self) {
+        let _ = self.event_sender.send(ExternalSurfaceEvent::Dropped);
+        let _ = self
+            .command_sender
+            .send(ExternalSurfaceCommand::HostDropped(self.id));
+    }
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -665,6 +789,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;
+    #[cfg(target_os = "windows")]
+    fn create_external_surface_host(
+        &self,
+        _event_sender: Sender<ExternalSurfaceEvent>,
+    ) -> Option<ExternalSurfaceHost> {
+        None
+    }
 
     // Linux specific methods
     fn inner_window_bounds(&self) -> WindowBounds {
