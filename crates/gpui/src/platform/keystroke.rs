@@ -32,6 +32,20 @@ pub struct Keystroke {
     pub key_char: Option<String>,
 }
 
+/// Native Windows keyboard metadata captured from a Win32 key message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Hash)]
+pub struct WindowsNativeKey {
+    /// `WPARAM` virtual-key code.
+    pub virtual_key: u16,
+    /// Low-byte scan code from the Win32 key message.
+    pub scan_code: u16,
+    /// `dwControlKeyState`-compatible modifier bitfield.
+    pub control_key_state: u32,
+
+    /// Whether the key is now pressed.
+    pub is_down: bool,
+}
+
 /// Represents a keystroke that can be used in keybindings and displayed to the user.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct KeybindingKeystroke {

@@ -343,6 +343,7 @@ impl WebWindowInner {
             this.dispatch_input(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                 modifiers,
                 capslock,
+                changed_native_key: None,
             }));
 
             let key = dom_key_to_gpui_key(&event);
@@ -366,6 +367,7 @@ impl WebWindowInner {
                 keystroke,
                 is_held,
                 prefer_character_input: false,
+                native_key: None,
             }));
 
             if let Some(result) = result {
@@ -405,6 +407,7 @@ impl WebWindowInner {
             this.dispatch_input(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                 modifiers,
                 capslock,
+                changed_native_key: None,
             }));
 
             let key = dom_key_to_gpui_key(&event);
@@ -423,7 +426,10 @@ impl WebWindowInner {
                 key_char,
             };
 
-            this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
+            this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent {
+                keystroke,
+                native_key: None,
+            }));
         })
     }
 

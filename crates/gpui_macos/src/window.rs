@@ -2207,11 +2207,13 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
             PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                 modifiers,
                 capslock,
+                changed_native_key: _,
             }) => {
                 // Only raise modifiers changed event when they have actually changed
                 if let Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: prev_modifiers,
                     capslock: prev_capslock,
+                    changed_native_key: _,
                 })) = &lock.previous_modifiers_changed_event
                     && prev_modifiers == modifiers
                     && prev_capslock == capslock
@@ -2668,6 +2670,7 @@ extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
             keystroke,
             is_held: false,
             prefer_character_input: false,
+            native_key: None,
         }));
         state.as_ref().lock().do_command_handled = Some(!handled.propagate);
     }

@@ -24,6 +24,8 @@ use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
+#[cfg(target_os = "windows")]
+use crossbeam_channel::Sender;
 use derive_more::{Deref, DerefMut};
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -4225,6 +4227,7 @@ impl Window {
                 keystroke: keystroke.clone(),
                 is_held: false,
                 prefer_character_input: false,
+                native_key: None,
             }),
             cx,
         );
@@ -4717,6 +4720,7 @@ impl Window {
                 keystroke: replay.keystroke.clone(),
                 is_held: false,
                 prefer_character_input: true,
+                native_key: None,
             };
 
             cx.propagate_event = true;

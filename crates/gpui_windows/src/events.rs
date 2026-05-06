@@ -6,6 +6,7 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
+        System::Console::*,
         System::SystemServices::*,
         UI::{
             Controls::*,
@@ -346,8 +347,11 @@ impl WindowsWindowInner {
     }
 
     fn handle_syskeyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
-        let input = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
-            PlatformInput::KeyUp(KeyUpEvent { keystroke })
+        let input = handle_key_event(wparam, lparam, &self.state, |keystroke, _, native_key| {
+            PlatformInput::KeyUp(KeyUpEvent {
+                keystroke,
+                native_key: Some(native_key),
+            })
         })?;
         let mut func = self.state.callbacks.input.take()?;
 
@@ -365,11 +369,12 @@ impl WindowsWindowInner {
             wparam,
             lparam,
             &self.state,
-            |keystroke, prefer_character_input| {
+            |keystroke, prefer_character_input, native_key| {
                 PlatformInput::KeyDown(KeyDownEvent {
                     keystroke,
                     is_held: lparam.0 & (0x1 << 30) > 0,
                     prefer_character_input,
+                    native_key: Some(native_key),
                 })
             },
         ) else {
@@ -388,9 +393,14 @@ impl WindowsWindowInner {
     }
 
     fn handle_keyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
-        let Some(input) = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
-            PlatformInput::KeyUp(KeyUpEvent { keystroke })
-        }) else {
+        let Some(input) =
+            handle_key_event(wparam, lparam, &self.state, |keystroke, _, native_key| {
+                PlatformInput::KeyUp(KeyUpEvent {
+                    keystroke,
+                    native_key: Some(native_key),
+                })
+            })
+        else {
             return Some(1);
         };
 
@@ -746,6 +756,7 @@ impl WindowsWindowInner {
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: current_modifiers(),
                     capslock: current_capslock(),
+                    changed_native_key: None,
                 });
                 func(input);
                 this.state.callbacks.input.set(Some(func));
@@ -1338,47 +1349,167 @@ fn handle_key_event<F>(
     f: F,
 ) -> Option<PlatformInput>
 where
-    F: FnOnce(Keystroke, bool) -> PlatformInput,
+    F: FnOnce(Keystroke, bool, WindowsNativeKey) -> PlatformInput,
 {
     let virtual_key = VIRTUAL_KEY(wparam.loword());
     let modifiers = current_modifiers();
+    let capslock = current_capslock();
+    let key_down = is_key_down_message(lparam);
+    let native_key = WindowsNativeKey {
+        virtual_key: virtual_key.0,
+        scan_code: (lparam.hiword() & 0xFF) as u16,
+        control_key_state: current_control_key_state(virtual_key, lparam, modifiers, capslock),
+        is_down: key_down,
+    };
 
     match virtual_key {
         VK_SHIFT | VK_CONTROL | VK_MENU | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN => {
-            if state
-                .last_reported_modifiers
-                .get()
-                .is_some_and(|prev_modifiers| prev_modifiers == modifiers)
-            {
+            if is_repeated_modifier_message(key_down, lparam, state, modifiers) {
                 return None;
             }
             state.last_reported_modifiers.set(Some(modifiers));
-            Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
-                modifiers,
-                capslock: current_capslock(),
-            }))
+            Some(build_modifiers_changed_event(
+                modifiers, capslock, native_key,
+            ))
         }
         VK_PACKET => None,
         VK_CAPITAL => {
-            let capslock = current_capslock();
-            if state
-                .last_reported_capslock
-                .get()
-                .is_some_and(|prev_capslock| prev_capslock == capslock)
-            {
+            if is_repeated_capslock_message(key_down, lparam, state, capslock) {
                 return None;
             }
             state.last_reported_capslock.set(Some(capslock));
-            Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
-                modifiers,
-                capslock,
-            }))
+            Some(build_modifiers_changed_event(
+                modifiers, capslock, native_key,
+            ))
         }
         vkey => {
             let keystroke = parse_normal_key(vkey, lparam, modifiers)?;
-            Some(f(keystroke.0, keystroke.1))
+            Some(f(keystroke.0, keystroke.1, native_key))
         }
     }
+}
+
+fn build_modifiers_changed_event(
+    modifiers: Modifiers,
+    capslock: Capslock,
+    native_key: WindowsNativeKey,
+) -> PlatformInput {
+    PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+        modifiers,
+        capslock,
+        changed_native_key: modifier_changed_native_key(native_key),
+    })
+}
+
+fn is_repeated_modifier_message(
+    key_down: bool,
+    lparam: LPARAM,
+    state: &WindowsWindowState,
+    modifiers: Modifiers,
+) -> bool {
+    key_down
+        && is_repeat_keydown(lparam)
+        && state
+            .last_reported_modifiers
+            .get()
+            .is_some_and(|previous_modifiers| previous_modifiers == modifiers)
+}
+
+fn is_repeated_capslock_message(
+    key_down: bool,
+    lparam: LPARAM,
+    state: &WindowsWindowState,
+    capslock: Capslock,
+) -> bool {
+    key_down
+        && is_repeat_keydown(lparam)
+        && state
+            .last_reported_capslock
+            .get()
+            .is_some_and(|previous_capslock| previous_capslock == capslock)
+}
+
+#[inline]
+fn is_key_down_message(lparam: LPARAM) -> bool {
+    lparam.0 & (1 << 31) == 0
+}
+
+#[inline]
+fn is_repeat_keydown(lparam: LPARAM) -> bool {
+    lparam.0 & (1 << 30) != 0
+}
+
+fn modifier_changed_native_key(native_key: WindowsNativeKey) -> Option<WindowsNativeKey> {
+    match native_key.virtual_key {
+        vk if vk == VK_SHIFT.0
+            || vk == VK_CONTROL.0
+            || vk == VK_MENU.0
+            || vk == VK_LMENU.0
+            || vk == VK_RMENU.0
+            || vk == VK_LWIN.0
+            || vk == VK_RWIN.0
+            || vk == VK_CAPITAL.0 =>
+        {
+            Some(native_key)
+        }
+        _ => None,
+    }
+}
+
+fn current_control_key_state(
+    virtual_key: VIRTUAL_KEY,
+    lparam: LPARAM,
+    modifiers: Modifiers,
+    capslock: Capslock,
+) -> u32 {
+    let mut control_key_state = 0;
+
+    if modifiers.shift {
+        control_key_state |= SHIFT_PRESSED;
+    }
+
+    if is_virtual_key_pressed(VK_LCONTROL) {
+        control_key_state |= LEFT_CTRL_PRESSED;
+    }
+    if is_virtual_key_pressed(VK_RCONTROL) {
+        control_key_state |= RIGHT_CTRL_PRESSED;
+    }
+    if is_virtual_key_pressed(VK_LMENU) {
+        control_key_state |= LEFT_ALT_PRESSED;
+    }
+    if is_virtual_key_pressed(VK_RMENU) {
+        control_key_state |= RIGHT_ALT_PRESSED;
+    }
+
+    if capslock.on {
+        control_key_state |= CAPSLOCK_ON;
+    }
+    if toggle_key_is_on(VK_NUMLOCK) {
+        control_key_state |= NUMLOCK_ON;
+    }
+    if toggle_key_is_on(VK_SCROLL) {
+        control_key_state |= SCROLLLOCK_ON;
+    }
+
+    if lparam.0 & (1 << 24) != 0 {
+        control_key_state |= ENHANCED_KEY;
+    }
+
+    if virtual_key == VK_RCONTROL {
+        control_key_state |= RIGHT_CTRL_PRESSED | ENHANCED_KEY;
+        control_key_state &= !LEFT_CTRL_PRESSED;
+    }
+    if virtual_key == VK_RMENU {
+        control_key_state |= RIGHT_ALT_PRESSED | ENHANCED_KEY;
+        control_key_state &= !LEFT_ALT_PRESSED;
+    }
+
+    control_key_state
+}
+
+#[inline]
+fn toggle_key_is_on(vkey: VIRTUAL_KEY) -> bool {
+    (unsafe { GetKeyState(vkey.0 as i32) & 1 }) > 0
 }
 
 fn parse_immutable(vkey: VIRTUAL_KEY) -> Option<String> {

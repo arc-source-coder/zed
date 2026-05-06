@@ -1,6 +1,6 @@
 use crate::{
     Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Pixels, Point, Render,
-    Window, point, seal::Sealed,
+    Window, WindowsNativeKey, point, seal::Sealed,
 };
 use smallvec::SmallVec;
 use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
@@ -32,6 +32,9 @@ pub struct KeyDownEvent {
     /// Whether to prefer character input over keybindings for this keystroke.
     /// In some cases, like AltGr on Windows, modifiers are significant for character input.
     pub prefer_character_input: bool,
+
+    /// Native Windows keyboard metadata captured at the platform boundary.
+    pub native_key: Option<WindowsNativeKey>,
 }
 
 impl Sealed for KeyDownEvent {}
@@ -47,6 +50,9 @@ impl KeyEvent for KeyDownEvent {}
 pub struct KeyUpEvent {
     /// The keystroke that was released.
     pub keystroke: Keystroke,
+
+    /// Native Windows keyboard metadata captured at the platform boundary.
+    pub native_key: Option<WindowsNativeKey>,
 }
 
 impl Sealed for KeyUpEvent {}
@@ -64,6 +70,9 @@ pub struct ModifiersChangedEvent {
     pub modifiers: Modifiers,
     /// The new state of the capslock key
     pub capslock: Capslock,
+    /// The specific native key transition that triggered this update, when the
+    /// platform can report it losslessly.
+    pub changed_native_key: Option<WindowsNativeKey>,
 }
 
 impl Sealed for ModifiersChangedEvent {}

@@ -1534,6 +1534,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: state.modifiers,
                     capslock: state.capslock,
+                    changed_native_key: None,
                 });
                 drop(state);
 
@@ -1610,6 +1611,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                             keystroke: keystroke.clone(),
                             is_held: false,
                             prefer_character_input: false,
+                            native_key: None,
                         });
 
                         state.repeat.current_id += 1;
@@ -1625,6 +1627,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                     keystroke,
                                     is_held: true,
                                     prefer_character_input: false,
+                                    native_key: None,
                                 });
                                 move |event_timestamp, _metadata, this| {
                                     let client = this.get_client();
@@ -1655,6 +1658,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     wl_keyboard::KeyState::Released if !keysym.is_modifier_key() => {
                         let input = PlatformInput::KeyUp(KeyUpEvent {
                             keystroke: keystroke_from_xkb(keymap_state, state.modifiers, keycode),
+                            native_key: None,
                         });
 
                         if state.repeat.current_keycode == Some(keycode) {
@@ -1711,6 +1715,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                             },
                             is_held: false,
                             prefer_character_input: false,
+                            native_key: None,
                         }));
                     } else {
                         window.handle_ime(ImeInput::InsertText(commit_text));
