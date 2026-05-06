@@ -1,5 +1,7 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+#[cfg(target_os = "macos")]
+use crate::PaintSurface;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, ArcPath,
     Arena, Asset, AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
@@ -20,6 +22,8 @@ use crate::{
     WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
     transparent_black,
 };
+#[cfg(target_os = "windows")]
+use crate::{ExternalSurfaceEvent, ExternalSurfaceHost, PositionExternalSurface};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
@@ -3864,8 +3868,6 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
-        use crate::PaintSurface;
-
         self.invalidator.debug_assert_paint();
 
         let bounds = self.snap_bounds(bounds);
@@ -3876,6 +3878,26 @@ impl Window {
             content_mask,
             image_buffer,
         });
+    }
+
+    /// Publish the placement for an externally presented surface host.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "windows")]
+    pub fn paint_external_surface(&mut self, host: &ExternalSurfaceHost, bounds: Bounds<Pixels>) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame
+            .scene
+            .insert_external_surface(PositionExternalSurface {
+                order: 0,
+                id: host.id(),
+                bounds,
+                content_mask,
+            });
     }
 
     /// Removes an image from the sprite atlas.
@@ -5178,6 +5200,15 @@ impl Window {
     /// Currently returns None on Mac and Windows.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.platform_window.gpu_specs()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn create_external_surface_host(
+        &self,
+        event_sender: Sender<ExternalSurfaceEvent>,
+    ) -> Option<ExternalSurfaceHost> {
+        self.platform_window
+            .create_external_surface_host(event_sender)
     }
 
     /// Perform titlebar double-click action.

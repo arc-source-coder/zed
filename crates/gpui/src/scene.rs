@@ -8,6 +8,8 @@ use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
+#[cfg(target_os = "windows")]
+use crate::ExternalSurfaceId;
 use std::{
     fmt::Debug,
     iter::Peekable,
@@ -37,6 +39,8 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    #[cfg(target_os = "windows")]
+    pub external_surfaces: Vec<PositionExternalSurface>,
 }
 
 #[expect(missing_docs)]
@@ -53,6 +57,8 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        #[cfg(target_os = "windows")]
+        self.external_surfaces.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -125,10 +131,32 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn insert_external_surface(&mut self, mut surface: PositionExternalSurface) {
+        let clipped_bounds = surface.bounds.intersect(&surface.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return;
+        }
+
+        let order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        surface.order = order;
+        self.external_surfaces.push(surface.clone());
+        self.paint_operations
+            .push(PaintOperation::ExternalSurface(surface));
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                #[cfg(target_os = "windows")]
+                PaintOperation::ExternalSurface(surface) => {
+                    self.insert_external_surface(surface.clone())
+                }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -147,6 +175,8 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        #[cfg(target_os = "windows")]
+        self.external_surfaces.sort_by_key(|surface| surface.order);
     }
 
     #[cfg_attr(
@@ -200,6 +230,8 @@ pub(crate) enum PrimitiveKind {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    #[cfg(target_os = "windows")]
+    ExternalSurface(PositionExternalSurface),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }
@@ -725,6 +757,16 @@ impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
     }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct PositionExternalSurface {
+    pub order: DrawOrder,
+    pub id: ExternalSurfaceId,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

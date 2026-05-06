@@ -12,6 +12,7 @@ use std::{
 
 use ::util::ResultExt;
 use anyhow::{Context as _, Result};
+use crossbeam_channel::Sender;
 use futures::channel::oneshot::{self, Receiver};
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
@@ -944,6 +945,16 @@ impl PlatformWindow for WindowsWindow {
 
     fn get_raw_handle(&self) -> HWND {
         self.0.hwnd
+    }
+
+    fn create_external_surface_host(
+        &self,
+        event_sender: Sender<ExternalSurfaceEvent>,
+    ) -> Option<ExternalSurfaceHost> {
+        self.state
+            .renderer
+            .borrow_mut()
+            .create_external_surface_host(event_sender)
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
