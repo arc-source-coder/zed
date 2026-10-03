@@ -1,7 +1,11 @@
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
+#[cfg(target_os = "windows")]
+use crate::ExternalSurface;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
+use crate::interactive::TouchEvent;
 #[cfg(feature = "profiler")]
 use crate::profiler;
 use crate::{
@@ -24,14 +28,11 @@ use crate::{
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
-
-use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
-use crate::interactive::TouchEvent;
+use crate::{ExternalSurfaceEvent, ExternalSurfaceHost, ExternalSurfaceId};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use core_video::pixel_buffer::CVPixelBuffer;
-#[cfg(target_os = "windows")]
 use crossbeam_channel::Sender;
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
@@ -5053,6 +5054,24 @@ impl Window {
         });
     }
 
+    /// Publish the placement for an externally presented surface host.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "windows")]
+    pub fn paint_external_surface(&mut self, id: ExternalSurfaceId, bounds: Bounds<Pixels>) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        self.next_frame
+            .scene
+            .insert_external_surface(ExternalSurface {
+                order: 0,
+                id,
+                bounds: bounds.scale(scale_factor),
+                content_mask: self.content_mask().scale(scale_factor),
+            });
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {
@@ -6809,6 +6828,29 @@ impl Window {
     /// Currently returns None on Mac and Windows.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.platform_window.gpu_specs()
+    }
+
+    /// Create a host for externally rendered content attached to this window.
+    pub fn create_external_surface_host(
+        &self,
+        sender: Sender<ExternalSurfaceEvent>,
+    ) -> Option<ExternalSurfaceHost> {
+        self.platform_window.create_external_surface_host(sender)
+    }
+
+    /// Attach a Windows DXGI swapchain to an external surface host.
+    #[cfg(target_os = "windows")]
+    pub fn set_external_surface_swap_chain(
+        &mut self,
+        id: ExternalSurfaceId,
+        sc: windows::Win32::Graphics::Dxgi::IDXGISwapChain2,
+    ) -> Result<()> {
+        self.platform_window.set_external_surface_swap_chain(id, sc)
+    }
+
+    /// Remove an external surface host from this window's platform renderer.
+    pub fn drop_external_surface(&mut self, id: ExternalSurfaceId) -> Result<()> {
+        self.platform_window.drop_external_surface(id)
     }
 
     /// Perform titlebar double-click action.

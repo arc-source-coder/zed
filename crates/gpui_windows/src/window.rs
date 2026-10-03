@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use crossbeam_channel::Sender;
 use futures::channel::oneshot::{self, Receiver};
 use gpui_util::ResultExt;
 use raw_window_handle as rwh;
@@ -1050,6 +1051,31 @@ impl PlatformWindow for WindowsWindow {
 
     fn get_raw_handle(&self) -> HWND {
         self.0.hwnd
+    }
+
+    fn create_external_surface_host(
+        &self,
+        event_sender: Sender<ExternalSurfaceEvent>,
+    ) -> Option<ExternalSurfaceHost> {
+        self.state
+            .renderer
+            .borrow_mut()
+            .create_external_surface_host(event_sender)
+    }
+
+    fn set_external_surface_swap_chain(
+        &mut self,
+        id: ExternalSurfaceId,
+        swap_chain: windows::Win32::Graphics::Dxgi::IDXGISwapChain2,
+    ) -> anyhow::Result<()> {
+        self.state
+            .renderer
+            .borrow_mut()
+            .set_external_surface_swap_chain(id, swap_chain)
+    }
+
+    fn drop_external_surface(&mut self, id: ExternalSurfaceId) -> anyhow::Result<()> {
+        self.state.renderer.borrow_mut().drop_external_surface(id)
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

@@ -35,6 +35,8 @@ pub(crate) type PlatformScreenCaptureFrame = ();
 pub(crate) type PlatformScreenCaptureFrame =
     objc2_core_foundation::CFRetained<objc2_core_video::CVImageBuffer>;
 
+use crossbeam_channel::Sender;
+
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
@@ -982,6 +984,82 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
+/// Stable identifier for an externally rendered surface hosted by a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExternalSurfaceId(pub u64);
+
+/// Window-derived state an external surface needs to size and present itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExternalSurfaceState {
+    /// Logical size of the host area in pixels.
+    pub logical_size: Size<Pixels>,
+    /// Scale factor of the window containing the external surface.
+    pub window_scale_factor: f32,
+    /// Whether the host area is currently occluded.
+    pub occluded: bool,
+}
+
+impl Default for ExternalSurfaceState {
+    fn default() -> Self {
+        Self {
+            logical_size: size(px(0.0), px(0.0)),
+            window_scale_factor: 1.0,
+            occluded: false,
+        }
+    }
+}
+
+/// Events sent from GPUI to an external surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExternalSurfaceEvent {
+    /// The host area's size, scale, or visibility state changed.
+    StateChanged(ExternalSurfaceState),
+    /// The external surface host was dropped.
+    Dropped,
+}
+
+/// Opaque host for an externally presented surface.
+pub struct ExternalSurfaceHost {
+    /// Identifier used by the platform renderer to match scene entries to hosted content.
+    pub id: ExternalSurfaceId,
+    event_sender: Sender<ExternalSurfaceEvent>,
+}
+
+impl ExternalSurfaceHost {
+    #[doc(hidden)]
+    pub fn new(id: ExternalSurfaceId, event_sender: Sender<ExternalSurfaceEvent>) -> Self {
+        Self { id, event_sender }
+    }
+
+    /// Attach a Windows DXGI swapchain to this host.
+    #[cfg(target_os = "windows")]
+    pub fn set_swap_chain(
+        &self,
+        window: &mut Window,
+        swap_chain: windows::Win32::Graphics::Dxgi::IDXGISwapChain2,
+    ) -> Result<()> {
+        window.set_external_surface_swap_chain(self.id, swap_chain)
+    }
+
+    /// Publish updated host state to the external surface owner.
+    pub fn update_state(&self, next_state: ExternalSurfaceState) {
+        let _ = self
+            .event_sender
+            .send(ExternalSurfaceEvent::StateChanged(next_state));
+    }
+
+    /// Remove this host from the platform renderer for the given window.
+    pub fn close(self, window: &mut Window) -> Result<()> {
+        window.drop_external_surface(self.id)
+    }
+}
+
+impl Drop for ExternalSurfaceHost {
+    fn drop(&mut self) {
+        let _ = self.event_sender.send(ExternalSurfaceEvent::Dropped);
+    }
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -1104,6 +1182,23 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;
+
+    fn create_external_surface_host(
+        &self,
+        _event_sender: Sender<ExternalSurfaceEvent>,
+    ) -> Option<ExternalSurfaceHost> {
+        None
+    }
+    #[cfg(target_os = "windows")]
+    fn set_external_surface_swap_chain(
+        &mut self,
+        id: ExternalSurfaceId,
+        swap_chain: windows::Win32::Graphics::Dxgi::IDXGISwapChain2,
+    ) -> Result<()>;
+
+    fn drop_external_surface(&mut self, _id: ExternalSurfaceId) -> Result<()> {
+        Ok(())
+    }
 
     // Linux specific methods
     fn inner_window_bounds(&self) -> WindowBounds {

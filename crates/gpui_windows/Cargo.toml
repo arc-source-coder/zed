@@ -26,6 +26,7 @@ accesskit_windows.workspace = true
 anyhow.workspace = true
 collections.workspace = true
 dunce.workspace = true
+crossbeam-channel = "0.5"
 etagere.workspace = true
 futures.workspace = true
 gpui_util.workspace = true
