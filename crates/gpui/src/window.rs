@@ -31,6 +31,8 @@ use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use core_video::pixel_buffer::CVPixelBuffer;
+#[cfg(target_os = "windows")]
+use crossbeam_channel::Sender;
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
 use gpui_util::post_inc;
@@ -5435,6 +5437,7 @@ impl Window {
                 keystroke: keystroke.clone(),
                 is_held: false,
                 prefer_character_input: false,
+                native_key: None,
             }),
             cx,
         );
@@ -6310,6 +6313,7 @@ impl Window {
                 keystroke: replay.keystroke.clone(),
                 is_held: false,
                 prefer_character_input: true,
+                native_key: None,
             };
 
             cx.propagate_event = true;
@@ -8600,6 +8604,7 @@ mod tests {
                     keystroke: Keystroke::parse("down").expect("valid keystroke"),
                     is_held: false,
                     prefer_character_input: false,
+                    native_key: None,
                 }),
                 cx,
             );

@@ -5363,6 +5363,7 @@ mod tests {
                     keystroke,
                     is_held: false,
                     prefer_character_input: false,
+                    native_key: None,
                 }
                 .to_platform_input(),
                 cx,
@@ -5374,7 +5375,14 @@ mod tests {
     fn key_up(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
         let keystroke = Keystroke::parse(key).unwrap();
         cx.update_window(window, |_, window, cx| {
-            window.dispatch_event(KeyUpEvent { keystroke }.to_platform_input(), cx);
+            window.dispatch_event(
+                KeyUpEvent {
+                    keystroke,
+                    native_key: None,
+                }
+                .to_platform_input(),
+                cx,
+            );
         })
         .unwrap();
     }
