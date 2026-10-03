@@ -4,6 +4,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "windows")]
+use crate::ExternalSurfaceId;
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Path,
     PathTiles, Pixels, Point, Radians, ScaledPixels, Size, TimedTransformation,
@@ -61,6 +63,8 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     animations: Vec<SpriteAnimation>,
+    #[cfg(target_os = "windows")]
+    pub external_surfaces: Vec<ExternalSurface>,
 }
 
 #[expect(missing_docs)]
@@ -79,6 +83,8 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.animations.clear();
+        #[cfg(target_os = "windows")]
+        self.external_surfaces.clear();
     }
 
     /// Inserts a sprite that [`Self::advance_animations`] keeps moving. The
@@ -224,6 +230,16 @@ impl Scene {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn insert_external_surface(&mut self, surface: ExternalSurface) {
+        if surface.bounds.intersect(&surface.content_mask.bounds).is_empty() {
+            return;
+        }
+        self.external_surfaces.push(surface.clone());
+        self.paint_operations
+            .push(PaintOperation::ExternalSurface(surface));
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
@@ -237,6 +253,10 @@ impl Scene {
                     } else {
                         self.insert_primitive(primitive.clone());
                     }
+                }
+                #[cfg(target_os = "windows")]
+                PaintOperation::ExternalSurface(surface) => {
+                    self.insert_external_surface(surface.clone())
                 }
                 PaintOperation::StartLayer => self.push_layer(),
                 PaintOperation::EndLayer => self.pop_layer(),
@@ -391,6 +411,8 @@ impl PrimitiveKind {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    #[cfg(target_os = "windows")]
+    ExternalSurface(ExternalSurface),
     StartLayer,
     EndLayer,
 }
@@ -1055,6 +1077,17 @@ impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
     }
+}
+
+/// Where an externally presented surface shows through. It's composited below everything GPUI
+/// draws, in paint order, so it takes no draw order of its own.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct ExternalSurface {
+    pub id: ExternalSurfaceId,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
