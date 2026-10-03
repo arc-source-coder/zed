@@ -29,6 +29,8 @@ use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecogni
 use crate::interactive::TouchEvent;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
+#[cfg(target_os = "windows")]
+use crossbeam_channel::Sender;
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
 use gpui_util::post_inc;
@@ -5613,6 +5615,7 @@ impl Window {
                 keystroke: keystroke.clone(),
                 is_held: false,
                 prefer_character_input: false,
+                native_key: None,
             }),
             cx,
         );
@@ -6492,6 +6495,7 @@ impl Window {
                 keystroke: replay.keystroke.clone(),
                 is_held: false,
                 prefer_character_input: true,
+                native_key: None,
             };
 
             cx.propagate_event = true;
@@ -8999,6 +9003,7 @@ mod tests {
                     keystroke: Keystroke::parse("down").expect("valid keystroke"),
                     is_held: false,
                     prefer_character_input: false,
+                    native_key: None,
                 }),
                 cx,
             );
