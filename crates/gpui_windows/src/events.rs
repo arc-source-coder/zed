@@ -1187,16 +1187,14 @@ impl WindowsWindowInner {
     }
 
     fn handle_cursor_changed(&self, lparam: LPARAM) -> Option<isize> {
-        let had_cursor = self.state.current_cursor.get().is_some();
+        let cursor = (lparam.0 != 0).then(|| HCURSOR(lparam.0 as _));
+        self.state.current_cursor.set(cursor);
 
-        self.state.current_cursor.set(if lparam.0 == 0 {
-            None
-        } else {
-            Some(HCURSOR(lparam.0 as _))
-        });
-
-        if had_cursor != self.state.current_cursor.get().is_some() {
-            unsafe { SetCursor(self.state.current_cursor.get()) };
+        // Windows asks for the cursor (`WM_SETCURSOR`) only when the mouse moves, so a change
+        // that comes from elsewhere, like a modifier key, would wait for one. A cursor
+        // hidden while typing stays hidden until then.
+        if self.state.hovered.get() && self.state.cursor_visible.load(Ordering::Relaxed) {
+            unsafe { SetCursor(cursor) };
         }
 
         Some(0)
